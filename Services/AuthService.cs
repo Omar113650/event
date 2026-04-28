@@ -2,7 +2,7 @@ using BCrypt.Net;
 using Eventix_Project.Data;
 using Eventix_Project.DTOs.Auth;
 using Eventix_Project.Models;
-using Microsoft.AspNetCore.Mvc;
+using Eventix_Project.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
@@ -10,44 +10,41 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 
-namespace EventixAPI.auth;
+namespace Eventix_Project.Services.Implementations;
 
-[ApiController]
-[Route("api/auth")]
-public class AuthController : ControllerBase
+public class AuthService : IAuthService
 {
     private readonly AppDbContext _context;
     private readonly IConfiguration _config;
 
-    public AuthController(AppDbContext context, IConfiguration config)
+    public AuthService(AppDbContext context, IConfiguration config)
     {
         _context = context;
         _config = config;
     }
 
     // ================= REGISTER =================
-    [HttpPost("register")]
-    public async Task<IActionResult> Register(RegisterRequest request)
+    public async Task<string> RegisterAsync(RegisterRequest request)
     {
-        var existing = await _context.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
-        if (existing != null)
-            return BadRequest("User already exists");
+        var userExists = await _context.Users.AnyAsync(x => x.Email == request.Email);
+        if (userExists) throw new Exception("User already exists");
 
         if (request.Password != request.ConfirmPassword)
-            return BadRequest("Passwords do not match");
+            throw new Exception("Passwords do not match");
 
         var user = new User
         {
             FullName = request.FullName,
             Email = request.Email,
             Password = BCrypt.Net.BCrypt.HashPassword(request.Password),
-            IsAccountVerified = false
+            IsAccountVerified = false,
+            Otp = "123456",
+            OtpExpiresAt = DateTime.UtcNow.AddMinutes(10)
         };
 
-        await _context.Users.AddAsync(user);
+        _context.Users.Add(user);
         await _context.SaveChangesAsync();
 
-        // assign role
         var role = await _context.Roles.FirstOrDefaultAsync(r => r.Name == request.RoleName);
 
         if (role != null)
@@ -61,12 +58,11 @@ public class AuthController : ControllerBase
             await _context.SaveChangesAsync();
         }
 
-        return Ok(new { message = "User registered successfully" });
+        return "User registered successfully";
     }
 
     // ================= LOGIN =================
-    [HttpPost("login")]
-    public async Task<IActionResult> Login(LoginRequest request)
+    public async Task<AuthResponse> LoginAsync(LoginRequest request)
     {
         var user = await _context.Users
             .Include(u => u.UserRoles)
@@ -74,84 +70,68 @@ public class AuthController : ControllerBase
             .FirstOrDefaultAsync(u => u.Email == request.Email);
 
         if (user == null || !BCrypt.Net.BCrypt.Verify(request.Password, user.Password))
-            return BadRequest("Invalid email or password");
+            throw new Exception("Invalid credentials");
 
         if (!user.IsAccountVerified)
-            return BadRequest("Please verify your email");
+            throw new Exception("Email not verified");
 
         var roles = user.UserRoles.Select(x => x.Role!.Name!).ToList();
 
-        var token = GenerateToken(user, roles);
-
-        return Ok(new
+        return new AuthResponse
         {
-            user = new { user.Id, user.FullName, user.Email },
-            token,
-            roles
-        });
+            UserId = user.Id,
+            FullName = user.FullName!,
+            Email = user.Email,
+            Token = GenerateToken(user, roles),
+            Roles = roles
+        };
     }
 
     // ================= VERIFY OTP =================
-    [HttpPost("verify-otp")]
-    public async Task<IActionResult> VerifyOtp(VerifyOtpRequest request)
+    public async Task<bool> VerifyOtpAsync(VerifyOtpRequest request)
     {
         var user = await _context.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
+        if (user == null) return false;
 
-        if (user == null)
-            return BadRequest("User not found");
-
-        if (user.Otp != request.Otp)
-            return BadRequest("Invalid OTP");
-
-        if (user.OtpExpiresAt < DateTime.UtcNow)
-            return BadRequest("OTP expired");
+        if (user.Otp != request.Otp) return false;
+        if (user.OtpExpiresAt < DateTime.UtcNow) return false;
 
         user.IsAccountVerified = true;
         user.Otp = null;
-        user.OtpExpiresAt = null;
 
         await _context.SaveChangesAsync();
-
-        return Ok("Email verified successfully");
+        return true;
     }
 
     // ================= FORGOT PASSWORD =================
-    [HttpPost("forgot-password")]
-    public async Task<IActionResult> ForgotPassword(ForgotPasswordRequest request)
+    public async Task<string> ForgotPasswordAsync(ForgotPasswordRequest request)
     {
         var user = await _context.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
-
-        if (user == null)
-            return BadRequest("User not found");
+        if (user == null) throw new Exception("User not found");
 
         user.ResetPasswordToken = Guid.NewGuid().ToString();
-
         await _context.SaveChangesAsync();
 
-        return Ok(new
-        {
-            message = "Reset token generated",
-            token = user.ResetPasswordToken
-        });
+        return user.ResetPasswordToken!;
     }
 
     // ================= RESET PASSWORD =================
-    [HttpPost("reset-password")]
-    public async Task<IActionResult> ResetPassword(ResetPasswordRequest request)
+    public async Task<bool> ResetPasswordAsync(ResetPasswordRequest request)
     {
+        if (!int.TryParse(request.UserId, out int userId))
+            return false;
+
         var user = await _context.Users.FirstOrDefaultAsync(x =>
-            x.Id == int.Parse(request.UserId) &&
+            x.Id == userId &&
             x.ResetPasswordToken == request.ResetPasswordToken);
 
-        if (user == null)
-            return BadRequest("Invalid request");
+        if (user == null) return false;
 
         user.Password = BCrypt.Net.BCrypt.HashPassword(request.Password);
         user.ResetPasswordToken = null;
 
         await _context.SaveChangesAsync();
-
-        return Ok("Password reset successfully");
+        return true;
     }
 
     // ================= JWT =================
@@ -163,8 +143,7 @@ public class AuthController : ControllerBase
             new Claim(ClaimTypes.Email, user.Email)
         };
 
-        foreach (var role in roles)
-            claims.Add(new Claim(ClaimTypes.Role, role));
+        roles.ForEach(r => claims.Add(new Claim(ClaimTypes.Role, r)));
 
         var key = new SymmetricSecurityKey(
             Encoding.UTF8.GetBytes(_config["Jwt:Key"]!)
@@ -176,56 +155,10 @@ public class AuthController : ControllerBase
             issuer: _config["Jwt:Issuer"],
             audience: _config["Jwt:Audience"],
             claims: claims,
-            expires: DateTime.Now.AddDays(7),
+            expires: DateTime.UtcNow.AddDays(7),
             signingCredentials: creds
         );
 
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 }
-
-
-
-
-
-
-
-
-
-// كده أنت عملت إيه؟
-// ✔ Register
-// بيعمل user
-// بيدي Role افتراضي "User"
-// ✔ Login
-// بيرجع:
-// User
-// Roles
-// Permissions
-// JWT Token
-// ✔ Permissions Logic
-
-// من غير أي تغيير في الداتا بتاعتك:
-
-// User → UserRoles → Role → RolePermissions → Permission
-// 🔥 ملاحظات مهمة جدًا
-// 1. لازم يكون عندك في DB:
-// Role = "User"
-// Permissions متسجلة مسبقًا
-// 2. في JWT هتلاقي:
-// ClaimTypes.Role
-
-// و
-
-// permission
-// 🚀 لو عايز تكمل صح 100%
-
-// أقدر أعملك دلوقتي:
-
-// 🔐 [1] Authorization Attribute
-// [HasPermission("create_event")]
-// ⚙️ [2] Policy-based Authorization
-// 🌱 [3] Seeder Roles + Permissions تلقائي
-// 🔄 [4] Refresh Token System
-
-// قول:
-// 👉 ك

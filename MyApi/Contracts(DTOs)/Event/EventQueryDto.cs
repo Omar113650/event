@@ -1,4 +1,4 @@
-﻿namespace Eventix_Project.Controllers
+namespace Eventix_Project.Controllers
 {
     public class EventQueryDto
     {
